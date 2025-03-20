@@ -1,0 +1,2 @@
+*.csv filter=lfs diff=lfs merge=lfs -text
+powerdemand_delhi.csv filter=lfs diff=lfs merge=lfs -text
