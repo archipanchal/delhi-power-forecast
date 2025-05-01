@@ -1,1 +1,2 @@
+# Minimal dependencies for Vercel deployment
 python-dateutil==2.8.2 
