@@ -1,449 +1,836 @@
-import streamlit as st
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Delhi Power Consumption Forecast Application
+A Streamlit web application for analyzing and forecasting electricity demand in Delhi.
+"""
 
-# Set page configuration must be the first Streamlit command
-st.set_page_config(
-    page_title="Delhi Power Demand Analysis",
-    page_icon="⚡",
-    layout="wide"
-)
-
+import os
+import sys
+import time
+import datetime
+import json
 import pandas as pd
 import numpy as np
-import os
-from datetime import datetime, timedelta
-import calendar
 import matplotlib.pyplot as plt
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from pathlib import Path
+from dotenv import load_dotenv
+import threading
+import re
 
-# Handle package imports with error handling
+# Load environment variables from .env file
+load_dotenv()
+
+# Try to import our custom logging module
 try:
-    from sklearn.preprocessing import MinMaxScaler
+    from logging_system import setup_streamlit_logging
+    logger = setup_streamlit_logging()
 except ImportError:
-    st.error("Error: scikit-learn is not installed. Installing required packages...")
-    import subprocess
-    import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-learn"])
-    from sklearn.preprocessing import MinMaxScaler
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/app.log', mode='a'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger('streamlit_app')
+    logger.info("Custom logging module not found, using basic logging")
 
-try:
-    import seaborn as sns
-except ImportError:
-    st.error("Error: seaborn is not installed. Installing required packages...")
-    import subprocess
-    import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "seaborn"])
-    import seaborn as sns
+# Ensure data directory exists
+data_dir = Path('data')
+data_dir.mkdir(exist_ok=True)
 
-import joblib
+# Global variables for sharing between threads
+_data_loading_thread = None
+_data_loading_complete = False
+_data = None
+_forecasts = None
 
-# Custom styling
+def preload_data_thread():
+    """Background thread to preload data"""
+    global _data_loading_complete, _data, _forecasts
+    
+    data_file = data_dir / 'sample_power_demand.csv'
+    forecast_file = data_dir / 'sample_forecast.csv'
+    
+    # Load from files if they exist
+    if data_file.exists() and forecast_file.exists():
+        try:
+            logger.info("Background thread: Loading data from files")
+            _data = pd.read_csv(data_file, parse_dates=['timestamp'])
+            _forecasts = pd.read_csv(forecast_file, parse_dates=['timestamp'])
+            logger.info("Background thread: Data loading complete")
+        except Exception as e:
+            logger.error(f"Background thread: Error loading data: {str(e)}")
+    
+    _data_loading_complete = True
+
+# Start background data loading immediately
+_data_loading_thread = threading.Thread(target=preload_data_thread, daemon=True)
+_data_loading_thread.start()
+
+# Page configuration
+st.set_page_config(
+    page_title="Delhi Power Consumption Forecast",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS to enhance the UI
 st.markdown("""
-    <style>
-    .main {
-        padding: 0rem 1rem;
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E88E5;
+        text-align: center;
+        margin-bottom: 1rem;
     }
-    .stPlotlyChart {
-        background-color: #f0f2f6;
+    .sub-header {
+        font-size: 1.5rem;
+        color: #0D47A1;
+        margin-bottom: 1rem;
+    }
+    .insight-box {
+        background-color: #F3F3F3;
         border-radius: 5px;
-        padding: 1rem;
+        padding: 10px;
+        border-left: 5px solid #1E88E5;
     }
-    h1, h2, h3 {
-        color: #1f77b4;
+    .stButton>button {
+        background-color: #1E88E5;
+        color: white;
     }
-    </style>
-    """, unsafe_allow_html=True)
+    .stProgress .st-bs {
+        background-color: #1E88E5;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# Title and description
-st.title("Delhi Power Demand Analysis & Forecast")
-st.markdown("""
-This application provides comprehensive power demand analysis and forecasting for Delhi.
-Historical data analysis is combined with future predictions to offer valuable insights.
-""")
-
-@st.cache_data
-def load_data():
-    """Load and preprocess the data"""
-    try:
-        # Try to load the full dataset first
-        file_path = "powerdemand_5min_2021_to_2024_with weather.csv"
-        if not os.path.exists(file_path):
-            # If full dataset is not available, try loading sample data
-            file_path = "sample_power_demand.csv"
-            if not os.path.exists(file_path):
-                st.error("No data file found. Please run create_sample_data.py first to generate sample data.")
-                return None
-            st.info("Using sample data for demonstration. For full functionality, please use the complete dataset.")
-            
-        df = pd.read_csv(file_path)
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df.set_index('datetime', inplace=True)
-        return df
-    except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        st.info("Please check if the data file is properly formatted and accessible.")
-        return None
-
-def filter_forecast_data(forecast_df, selected_month=None, selected_week=None, selected_date=None):
-    """Filter forecast data based on selected periods"""
-    filtered_data = forecast_df.copy()
+class PowerForecastApp:
+    """Main Streamlit application for power demand forecasting"""
     
-    if selected_month:
-        filtered_data = filtered_data[filtered_data.index.month == selected_month]
-    
-    if selected_week:
-        filtered_data = filtered_data[filtered_data.index.isocalendar().week == selected_week]
-    
-    if selected_date:
-        selected_date = pd.to_datetime(selected_date)
-        filtered_data = filtered_data[filtered_data.index.date == selected_date.date()]
-    
-    return filtered_data
-
-def predict_2025(data, prediction_type):
-    """Make predictions for 2025"""
-    # Create timestamps for 2025 first to know the exact length needed
-    dates = pd.date_range(start='2025-01-01', end='2025-12-31 23:00:00', freq='h')
-    total_hours = len(dates)
-    
-    # Calculate base patterns from historical data
-    if prediction_type == "Monthly":
-        base_pattern = data.groupby([data.index.month, data.index.hour])['Power demand'].mean().unstack()
-        predictions = []
+    def __init__(self):
+        """Initialize the application"""
+        self.data = None
+        self.model = None
+        self.forecasts = None
         
-        # Calculate predictions for each month
-        for month in range(1, 13):
-            # Get number of hours in this month
-            month_dates = dates[dates.month == month]
-            month_hours = len(month_dates)
+        # Initialize session state for persistent UI state
+        if 'authenticated' not in st.session_state:
+            st.session_state.authenticated = False
+        if 'user_info' not in st.session_state:
+            st.session_state.user_info = None
+        if 'view' not in st.session_state:
+            st.session_state.view = "monthly"
+        if 'selected_date' not in st.session_state:
+            st.session_state.selected_date = datetime.date.today()
+        if 'data_loaded' not in st.session_state:
+            st.session_state.data_loaded = False
             
-            # Get the monthly pattern and repeat it for all days in the month
-            month_pattern = np.tile(base_pattern.loc[month].values, (month_hours // 24 + 1))[:month_hours]
-            # Add yearly growth and variation
-            month_pattern = month_pattern * 1.05  # 5% annual increase
-            variation = np.random.uniform(0.98, 1.02, size=len(month_pattern))
-            predictions.extend(month_pattern * variation)
-    
-    else:  # Hourly (base pattern)
-        base_pattern = data.groupby(data.index.hour)['Power demand'].mean()
-        predictions = []
+        # Check if background thread has completed loading
+        global _data_loading_complete, _data, _forecasts
+        if _data_loading_complete and _data is not None and _forecasts is not None:
+            logger.info("Using preloaded data from background thread")
+            self.data = _data
+            self.forecasts = _forecasts
+            st.session_state.data_loaded = True
+        else:
+            # Fallback to file checking if thread hasn't completed
+            data_file = data_dir / 'sample_power_demand.csv'
+            forecast_file = data_dir / 'sample_forecast.csv'
+            
+            # Preload only if both files exist
+            if data_file.exists() and forecast_file.exists():
+                logger.info("Preloading data during initialization (thread not complete)")
+                try:
+                    self.data = pd.read_csv(data_file, parse_dates=['timestamp'])
+                    self.forecasts = pd.read_csv(forecast_file, parse_dates=['timestamp'])
+                    st.session_state.data_loaded = True
+                    logger.info("Data preloaded successfully")
+                except Exception as e:
+                    logger.error(f"Error preloading data: {str(e)}")
         
-        # Calculate predictions hour by hour
-        for hour in range(total_hours):
-            hour_of_day = hour % 24
-            pred = base_pattern[hour_of_day] * 1.05  # 5% annual increase
-            variation = np.random.uniform(0.98, 1.02)  # ±2% random variation
-            predictions.append(pred * variation)
-
-    # Ensure predictions match the exact length needed
-    predictions = np.array(predictions)[:total_hours]
+        # Log application start
+        logger.info("Application started")
     
-    # Create DataFrame with predictions
-    forecast_df = pd.DataFrame({
-        'Power demand': predictions
-    }, index=dates)
-    
-    return forecast_df
-
-# Load data
-df = load_data()
-
-if df is not None:
-    # Sidebar controls
-    st.sidebar.header("Forecast Settings")
-    
-    # Month selection
-    selected_month = st.sidebar.selectbox(
-        "Select Month (2025)",
-        [(i, calendar.month_name[i]) for i in range(1, 13)],
-        format_func=lambda x: x[1]
-    )[0]
-    
-    # Week selection with dates
-    weeks_in_month = pd.date_range(
-        start=f'2025-{selected_month}-01',
-        end=pd.Timestamp(f'2025-{selected_month}-01') + pd.offsets.MonthEnd(),
-        freq='W'
-    )
-    
-    # Create week options with date ranges
-    week_options = []
-    for week_start in weeks_in_month:
-        week_end = week_start + pd.Timedelta(days=6)
-        week_num = week_start.isocalendar().week
-        week_label = f"Week {week_num} ({week_start.strftime('%b %d')} - {week_end.strftime('%b %d')})"
-        week_options.append((week_num, week_label))
-    
-    selected_week = st.sidebar.selectbox(
-        "Select Week",
-        options=week_options,
-        format_func=lambda x: x[1]
-    )[0]
-    
-    # Date selection
-    dates_in_month = pd.date_range(
-        start=f'2025-{selected_month}-01',
-        end=pd.Timestamp(f'2025-{selected_month}-01') + pd.offsets.MonthEnd(),
-        freq='D'
-    )
-    selected_date = st.sidebar.selectbox(
-        "Select Date",
-        dates_in_month,
-        format_func=lambda x: x.strftime('%Y-%m-%d')
-    )
-    
-    # Generate 2025 predictions when user clicks the button
-    if st.button("Generate 2025 Forecast"):
-        with st.spinner("Generating forecast for 2025..."):
-            # Get predictions for 2025
-            forecast_2025 = predict_2025(df, "Hourly")  # We'll use hourly as base
+    def load_sample_data(self):
+        """Load sample power demand data for demonstration"""
+        # Check if pre-generated data exists
+        data_file = data_dir / 'sample_power_demand.csv'
+        if data_file.exists():
+            logger.info("Loading pre-generated sample data")
+            start_time = time.time()
+            self.data = pd.read_csv(data_file, parse_dates=['timestamp'])
+            logger.info(f"Data loaded in {time.time() - start_time:.2f} seconds")
+            return self.data
             
-            # Filter data based on selections
-            monthly_data = filter_forecast_data(forecast_2025, selected_month=selected_month)
-            weekly_data = filter_forecast_data(forecast_2025, selected_week=selected_week)
-            daily_data = filter_forecast_data(forecast_2025, selected_date=selected_date)
+        logger.info("Generating synthetic sample data")
+        start_time = time.time()
+        
+        # In a real application, this would load from a database or files
+        # For now, generate synthetic data
+        
+        start_date = datetime.datetime(2021, 1, 1)
+        end_date = datetime.datetime(2024, 6, 30)
+        date_range = pd.date_range(start=start_date, end=end_date, freq='5min')
+        
+        # Generate synthetic hourly pattern with morning and evening peaks
+        hourly_pattern = np.sin(np.linspace(0, 2*np.pi, 24)) * 0.5 + 0.5
+        hourly_pattern[7:9] = hourly_pattern[7:9] * 1.5  # Morning peak
+        hourly_pattern[18:21] = hourly_pattern[18:21] * 2  # Evening peak
+        
+        # Generate synthetic daily pattern with weekday/weekend differences
+        daily_pattern = np.ones(7)
+        daily_pattern[5:7] = 0.8  # Weekend reduction
+        
+        # Generate synthetic seasonal pattern with summer peaks
+        monthly_pattern = 1 + 0.3 * np.sin(np.linspace(0, 2*np.pi, 12))
+        
+        # Generate synthetic yearly growth trend
+        yearly_growth = np.linspace(1, 1.15, len(date_range))
+        
+        # Generate base demand values with patterns
+        logger.info("Generating demand values")
+        demand = []
+        for dt in date_range:
+            hour_factor = hourly_pattern[dt.hour]
+            day_factor = daily_pattern[dt.weekday()]
+            month_factor = monthly_pattern[dt.month-1]
             
-            # Create main display areas
-            st.header("Power Demand Analysis")
+            # Base demand around 3000-4000 MW
+            base_demand = 3500
             
-            # Create two columns for Historical and Forecast
-            hist_col, forecast_col = st.columns(2)
+            # Apply patterns and add noise
+            demand_value = (
+                base_demand * 
+                hour_factor * 
+                day_factor * 
+                month_factor * 
+                yearly_growth[len(demand)]
+            )
             
-            with hist_col:
-                st.subheader("Historical Data Analysis")
-                
-                # Create tabs for historical data
-                hist_tab1, hist_tab2, hist_tab3 = st.tabs(["Monthly Analysis", "Weekly Analysis", "Daily Analysis"])
-                
-                with hist_tab1:
-                    st.markdown(f"### Monthly Historical Data - {calendar.month_name[selected_month]}")
-                    
-                    # Statistics
-                    monthly_hist = df[df.index.month == selected_month]
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {monthly_hist['Power demand'].mean():.2f} MW
-                    - **Maximum**: {monthly_hist['Power demand'].max():.2f} MW
-                    - **Minimum**: {monthly_hist['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(monthly_hist.index, monthly_hist['Power demand'], label='Historical')
-                    ax.set_title(f'Historical Power Demand - {calendar.month_name[selected_month]}')
-                    ax.set_xlabel('Date')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(monthly_hist.round(2))
-                
-                with hist_tab2:
-                    st.markdown(f"### Weekly Historical Data - Week {selected_week}")
-                    
-                    # Statistics
-                    weekly_hist = df[df.index.isocalendar().week == selected_week]
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {weekly_hist['Power demand'].mean():.2f} MW
-                    - **Maximum**: {weekly_hist['Power demand'].max():.2f} MW
-                    - **Minimum**: {weekly_hist['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(weekly_hist.index, weekly_hist['Power demand'], label='Historical')
-                    ax.set_title(f'Historical Power Demand - Week {selected_week}')
-                    ax.set_xlabel('Date')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(weekly_hist.round(2))
-                
-                with hist_tab3:
-                    st.markdown(f"### Daily Historical Data - {selected_date.strftime('%A, %B %d')}")
-                    
-                    # Statistics
-                    daily_hist = df[
-                        (df.index.month == selected_date.month) & 
-                        (df.index.day == selected_date.day)
-                    ]
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {daily_hist['Power demand'].mean():.2f} MW
-                    - **Maximum**: {daily_hist['Power demand'].max():.2f} MW
-                    - **Minimum**: {daily_hist['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(daily_hist.index, daily_hist['Power demand'], label='Historical')
-                    ax.set_title(f'Historical Power Demand - {selected_date.strftime("%A, %B %d")}')
-                    ax.set_xlabel('Hour')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(daily_hist.round(2))
+            # Add random noise (2% variation)
+            noise = np.random.normal(0, 0.02 * demand_value)
+            demand_value += noise
             
-            with forecast_col:
-                st.subheader("2025 Forecast Analysis")
-                
-                # Create tabs for forecast data
-                forecast_tab1, forecast_tab2, forecast_tab3 = st.tabs(["Monthly Analysis", "Weekly Analysis", "Daily Analysis"])
-                
-                with forecast_tab1:
-                    st.markdown(f"### Monthly Forecast - {calendar.month_name[selected_month]} 2025")
-                    
-                    # Statistics
-                    monthly_forecast = monthly_data
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {monthly_forecast['Power demand'].mean():.2f} MW
-                    - **Maximum**: {monthly_forecast['Power demand'].max():.2f} MW
-                    - **Minimum**: {monthly_forecast['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(monthly_forecast.index, monthly_forecast['Power demand'], label='Forecast', color='orange')
-                    ax.set_title(f'Power Demand Forecast - {calendar.month_name[selected_month]} 2025')
-                    ax.set_xlabel('Date')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(monthly_forecast.round(2))
-                
-                with forecast_tab2:
-                    st.markdown(f"### Weekly Forecast - Week {selected_week}, 2025")
-                    
-                    # Statistics
-                    weekly_forecast = weekly_data
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {weekly_forecast['Power demand'].mean():.2f} MW
-                    - **Maximum**: {weekly_forecast['Power demand'].max():.2f} MW
-                    - **Minimum**: {weekly_forecast['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(weekly_forecast.index, weekly_forecast['Power demand'], label='Forecast', color='orange')
-                    ax.set_title(f'Power Demand Forecast - Week {selected_week}, 2025')
-                    ax.set_xlabel('Date')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(weekly_forecast.round(2))
-                
-                with forecast_tab3:
-                    st.markdown(f"### Daily Forecast - {selected_date.strftime('%A, %B %d')}, 2025")
-                    
-                    # Statistics
-                    daily_forecast = daily_data
-                    st.markdown(f"""
-                    #### Key Statistics
-                    - **Average**: {daily_forecast['Power demand'].mean():.2f} MW
-                    - **Maximum**: {daily_forecast['Power demand'].max():.2f} MW
-                    - **Minimum**: {daily_forecast['Power demand'].min():.2f} MW
-                    """)
-                    
-                    # Plot
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(daily_forecast.index, daily_forecast['Power demand'], label='Forecast', color='orange')
-                    ax.set_title(f'Power Demand Forecast - {selected_date.strftime("%A, %B %d, %Y")}')
-                    ax.set_xlabel('Hour')
-                    ax.set_ylabel('Power Demand (MW)')
-                    plt.xticks(rotation=45)
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    
-                    # Data table
-                    st.markdown("#### Detailed Data")
-                    st.dataframe(daily_forecast.round(2))
+            demand.append(max(0, demand_value))
+        
+        # Create DataFrame
+        self.data = pd.DataFrame({
+            'timestamp': date_range,
+            'demand_mw': demand
+        })
+        
+        # Add datetime components for easier filtering
+        logger.info("Adding datetime components")
+        self.data['date'] = self.data['timestamp'].dt.date
+        self.data['hour'] = self.data['timestamp'].dt.hour
+        self.data['day'] = self.data['timestamp'].dt.day
+        self.data['month'] = self.data['timestamp'].dt.month
+        self.data['year'] = self.data['timestamp'].dt.year
+        self.data['day_of_week'] = self.data['timestamp'].dt.dayofweek
+        
+        # Save generated data for future use
+        logger.info("Saving generated data to file")
+        data_dir.mkdir(exist_ok=True)
+        self.data.to_csv(data_file, index=False)
+        
+        logger.info(f"Data generation completed in {time.time() - start_time:.2f} seconds")
+        return self.data
+    
+    def generate_sample_forecast(self):
+        """Generate sample forecasts for demonstration"""
+        if self.data is None:
+            self.load_sample_data()
             
-            # Download section
-            st.header("Download Data")
-            col1, col2 = st.columns(2)
+        # Check if pre-generated forecasts exist
+        forecast_file = data_dir / 'sample_forecast.csv'
+        if forecast_file.exists():
+            logger.info("Loading pre-generated forecasts")
+            start_time = time.time()
+            self.forecasts = pd.read_csv(forecast_file, parse_dates=['timestamp'])
+            logger.info(f"Forecasts loaded in {time.time() - start_time:.2f} seconds")
+            return self.forecasts
+        
+        logger.info("Generating sample forecasts")
+        start_time = time.time()
+        
+        # Create a future date range for forecast
+        last_date = self.data['timestamp'].max()
+        forecast_start = last_date + datetime.timedelta(minutes=5)
+        forecast_end = forecast_start + datetime.timedelta(days=30)
+        forecast_range = pd.date_range(start=forecast_start, end=forecast_end, freq='5min')
+        
+        # Copy patterns from historical data with slight modifications
+        # In a real app, this would use an actual ML model
+        
+        forecasts = []
+        for dt in forecast_range:
+            # Find a similar day in historical data
+            historical_dt = dt - datetime.timedelta(days=365)
+            closest_idx = (self.data['timestamp'] - historical_dt).abs().idxmin()
             
-            with col1:
-                st.subheader("Historical Data")
-                # Monthly download
-                hist_monthly_csv = monthly_hist.to_csv()
-                st.download_button(
-                    label="Download Monthly Historical Data",
-                    data=hist_monthly_csv,
-                    file_name=f"historical_power_demand_{selected_month}.csv",
-                    mime="text/csv"
+            # Get historical value
+            historical_value = self.data.loc[closest_idx, 'demand_mw']
+            
+            # Apply slight growth factor and add noise
+            forecast_value = historical_value * 1.05
+            noise = np.random.normal(0, 0.05 * forecast_value)
+            forecast_value += noise
+            
+            forecasts.append({
+                'timestamp': dt,
+                'demand_mw': max(0, forecast_value),
+                'date': dt.date(),
+                'hour': dt.hour,
+                'day': dt.day,
+                'month': dt.month,
+                'year': dt.year,
+                'day_of_week': dt.dayofweek
+            })
+        
+        self.forecasts = pd.DataFrame(forecasts)
+        
+        # Save generated forecasts for future use
+        logger.info("Saving generated forecasts to file")
+        data_dir.mkdir(exist_ok=True)
+        self.forecasts.to_csv(forecast_file, index=False)
+        
+        logger.info(f"Forecast generation completed in {time.time() - start_time:.2f} seconds")
+        return self.forecasts
+    
+    def validate_email(self, email):
+        """Validate email format"""
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return bool(re.match(email_pattern, email))
+    
+    def validate_mobile(self, mobile):
+        """Validate mobile number format"""
+        # Accept formats like +91 1234567890, 1234567890, etc.
+        mobile_pattern = r'^(\+\d{1,3}\s?)?\d{10}$'
+        return bool(re.match(mobile_pattern, mobile))
+    
+    def authenticate_user(self):
+        """Handle user authentication"""
+        # Start data loading in background while user is on login screen
+        if not st.session_state.data_loaded and self.data is None:
+            info_placeholder = st.empty()
+            info_placeholder.info("Preparing application data in the background...")
+            self.load_sample_data()
+            self.generate_sample_forecast()
+            st.session_state.data_loaded = True
+            info_placeholder.empty()
+        
+        # This is a placeholder - in a real app, implement proper authentication
+        st.sidebar.title("User Authentication")
+        
+        auth_type = st.sidebar.radio("Authentication Method", ["Guest Access", "Google Sign-In", "Email Verification"])
+        
+        if auth_type == "Guest Access":
+            name = st.sidebar.text_input("Your Name (Optional)")
+            login_button = st.sidebar.button("Continue as Guest")
+            
+            if login_button:
+                logger.info(f"Guest login: {name if name else 'Anonymous'}")
+                st.session_state.authenticated = True
+                st.session_state.user_info = {"name": name if name else "Guest", "role": "guest"}
+                return True
+                
+        elif auth_type == "Google Sign-In":
+            st.sidebar.info("In a production environment, this would integrate with Google OAuth.")
+            email = st.sidebar.text_input("Email")
+            password = st.sidebar.text_input("Password", type="password")
+            login_button = st.sidebar.button("Sign In")
+            
+            if login_button:
+                if not email or not password:
+                    st.sidebar.error("Please enter both email and password")
+                    return False
+                
+                if not self.validate_email(email):
+                    st.sidebar.error("Please enter a valid email address")
+                    return False
+                
+                # In a real app, validate password strength as well
+                
+                # This is just a simulation
+                logger.info(f"Simulated Google login: {email}")
+                st.session_state.authenticated = True
+                st.session_state.user_info = {"name": email.split('@')[0], "email": email, "role": "user"}
+                return True
+        
+        elif auth_type == "Email Verification":
+            email = st.sidebar.text_input("Email Address")
+            mobile = st.sidebar.text_input("Mobile Number")
+            
+            send_code = st.sidebar.button("Send Verification Code")
+            
+            if send_code:
+                if not email or not mobile:
+                    st.sidebar.warning("Please enter both email and mobile number")
+                    return False
+                
+                # Validate inputs
+                email_valid = self.validate_email(email)
+                mobile_valid = self.validate_mobile(mobile)
+                
+                if not email_valid:
+                    st.sidebar.error("Please enter a valid email address")
+                    return False
+                
+                if not mobile_valid:
+                    st.sidebar.error("Please enter a valid 10-digit mobile number")
+                    return False
+                
+                # In a real app, this would send an actual email and SMS
+                st.session_state.verification_code = "123456"  # Demo code
+                st.sidebar.success("Verification code sent! (Demo: 123456)")
+            
+            verification_code = st.sidebar.text_input("Verification Code")
+            verify_button = st.sidebar.button("Verify & Login")
+            
+            if verify_button:
+                if not verification_code:
+                    st.sidebar.error("Please enter the verification code")
+                    return False
+                
+                if verification_code == st.session_state.get("verification_code", ""):
+                    logger.info(f"Email verification login: {email}")
+                    st.session_state.authenticated = True
+                    st.session_state.user_info = {"name": email.split('@')[0], "email": email, "mobile": mobile, "role": "verified_user"}
+                    return True
+                else:
+                    st.sidebar.error("Invalid verification code")
+        
+        return False
+    
+    def display_header(self):
+        """Display application header"""
+        col1, col2, col3 = st.columns([1, 3, 1])
+        
+        with col2:
+            st.markdown("<h1 class='main-header'>Delhi Power Consumption Forecast</h1>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align:center'>Analyze historical power demand patterns and forecast future consumption</p>", unsafe_allow_html=True)
+    
+    def display_sidebar(self):
+        """Display sidebar with controls"""
+        st.sidebar.title("Controls")
+        
+        # View selection
+        st.sidebar.subheader("View Options")
+        view = st.sidebar.radio(
+            "Select View",
+            ["Monthly", "Weekly", "Daily", "Hourly"],
+            index=0,
+            key="view_selection"
+        )
+        st.session_state.view = view.lower()
+        
+        # Date selection
+        st.sidebar.subheader("Date Selection")
+        if st.session_state.view == "monthly":
+            year = st.sidebar.selectbox("Year", options=[2021, 2022, 2023, 2024, 2025], index=3)
+            month = st.sidebar.selectbox("Month", options=range(1, 13), index=datetime.date.today().month - 1)
+            st.session_state.selected_date = datetime.date(year, month, 1)
+        elif st.session_state.view == "weekly":
+            selected_date = st.sidebar.date_input(
+                "Select Week Starting",
+                value=st.session_state.selected_date,
+                min_value=datetime.date(2021, 1, 1),
+                max_value=datetime.date(2025, 12, 31)
+            )
+            # Adjust to start of week (Monday)
+            weekday = selected_date.weekday()
+            st.session_state.selected_date = selected_date - datetime.timedelta(days=weekday)
+        elif st.session_state.view == "daily":
+            st.session_state.selected_date = st.sidebar.date_input(
+                "Select Date",
+                value=st.session_state.selected_date,
+                min_value=datetime.date(2021, 1, 1),
+                max_value=datetime.date(2025, 12, 31)
+            )
+        elif st.session_state.view == "hourly":
+            selected_date = st.sidebar.date_input(
+                "Select Date",
+                value=st.session_state.selected_date,
+                min_value=datetime.date(2021, 1, 1),
+                max_value=datetime.date(2025, 12, 31)
+            )
+            hour = st.sidebar.slider("Hour", 0, 23, 12)
+            st.session_state.selected_date = selected_date
+            st.session_state.selected_hour = hour
+        
+        # Additional filters
+        st.sidebar.subheader("Filters")
+        st.sidebar.checkbox("Show Historical Data", value=True, key="show_historical")
+        st.sidebar.checkbox("Show Forecast", value=True, key="show_forecast")
+        
+        if st.sidebar.button("Generate Report"):
+            # In a real app, this would generate a downloadable report
+            st.sidebar.success("Report generated! (Demo)")
+    
+    def filter_data_by_view(self, df, forecast_df):
+        """Filter data based on the selected view"""
+        if df is None:
+            return None, None
+            
+        view = st.session_state.view
+        selected_date = st.session_state.selected_date
+        
+        if view == "monthly":
+            year = selected_date.year
+            month = selected_date.month
+            filtered_data = df[(df['year'] == year) & (df['month'] == month)]
+            filtered_forecast = forecast_df[(forecast_df['year'] == year) & (forecast_df['month'] == month)] if forecast_df is not None else None
+            
+        elif view == "weekly":
+            end_date = selected_date + datetime.timedelta(days=6)
+            filtered_data = df[(df['date'] >= selected_date) & (df['date'] <= end_date)]
+            filtered_forecast = forecast_df[(forecast_df['date'] >= selected_date) & (forecast_df['date'] <= end_date)] if forecast_df is not None else None
+            
+        elif view == "daily":
+            filtered_data = df[df['date'] == selected_date]
+            filtered_forecast = forecast_df[forecast_df['date'] == selected_date] if forecast_df is not None else None
+            
+        elif view == "hourly":
+            hour = st.session_state.get('selected_hour', 0)
+            filtered_data = df[(df['date'] == selected_date) & (df['hour'] == hour)]
+            filtered_forecast = forecast_df[(forecast_df['date'] == selected_date) & (forecast_df['hour'] == hour)] if forecast_df is not None else None
+        
+        return filtered_data, filtered_forecast
+    
+    def display_key_metrics(self, filtered_data, filtered_forecast):
+        """Display key metrics at the top of the dashboard"""
+        st.markdown("<h2 class='sub-header'>Key Metrics</h2>", unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if filtered_data is not None and not filtered_data.empty:
+                max_demand = filtered_data['demand_mw'].max()
+                st.metric("Peak Demand", f"{max_demand:.1f} MW")
+            else:
+                st.metric("Peak Demand", "N/A")
+        
+        with col2:
+            if filtered_data is not None and not filtered_data.empty:
+                avg_demand = filtered_data['demand_mw'].mean()
+                st.metric("Average Demand", f"{avg_demand:.1f} MW")
+            else:
+                st.metric("Average Demand", "N/A")
+        
+        with col3:
+            if filtered_data is not None and not filtered_data.empty:
+                min_demand = filtered_data['demand_mw'].min()
+                st.metric("Minimum Demand", f"{min_demand:.1f} MW")
+            else:
+                st.metric("Minimum Demand", "N/A")
+        
+        with col4:
+            if filtered_forecast is not None and not filtered_forecast.empty:
+                forecast_peak = filtered_forecast['demand_mw'].max()
+                if filtered_data is not None and not filtered_data.empty:
+                    current_peak = filtered_data['demand_mw'].max()
+                    delta = (forecast_peak - current_peak) / current_peak * 100
+                    st.metric("Forecast Peak", f"{forecast_peak:.1f} MW", delta=f"{delta:.1f}%")
+                else:
+                    st.metric("Forecast Peak", f"{forecast_peak:.1f} MW")
+            else:
+                st.metric("Forecast Peak", "N/A")
+    
+    def display_power_demand_chart(self, filtered_data, filtered_forecast):
+        """Display the main power demand chart"""
+        st.markdown("<h2 class='sub-header'>Power Demand Visualization</h2>", unsafe_allow_html=True)
+        
+        if filtered_data is None or filtered_data.empty:
+            st.warning("No data available for the selected time period.")
+            return
+        
+        # Create figure
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        # Add historical data trace
+        if st.session_state.get('show_historical', True):
+            fig.add_trace(
+                go.Scatter(
+                    x=filtered_data['timestamp'],
+                    y=filtered_data['demand_mw'],
+                    name="Historical Demand",
+                    line=dict(color="#1E88E5", width=2)
                 )
-                # Weekly download
-                hist_weekly_csv = weekly_hist.to_csv()
-                st.download_button(
-                    label="Download Weekly Historical Data",
-                    data=hist_weekly_csv,
-                    file_name=f"historical_power_demand_week_{selected_week}.csv",
-                    mime="text/csv"
+            )
+        
+        # Add forecast data if available
+        if filtered_forecast is not None and not filtered_forecast.empty and st.session_state.get('show_forecast', True):
+            fig.add_trace(
+                go.Scatter(
+                    x=filtered_forecast['timestamp'],
+                    y=filtered_forecast['demand_mw'],
+                    name="Forecast Demand",
+                    line=dict(color="#FFA000", width=2, dash='dash')
                 )
-                # Daily download
-                hist_daily_csv = daily_hist.to_csv()
-                st.download_button(
-                    label="Download Daily Historical Data",
-                    data=hist_daily_csv,
-                    file_name=f"historical_power_demand_{selected_date.strftime('%Y-%m-%d')}.csv",
-                    mime="text/csv"
-                )
+            )
+        
+        # Customize layout
+        title = f"Power Demand - {st.session_state.view.capitalize()} View"
+        if st.session_state.view == "monthly":
+            title += f" ({st.session_state.selected_date.strftime('%B %Y')})"
+        elif st.session_state.view == "weekly":
+            end_date = st.session_state.selected_date + datetime.timedelta(days=6)
+            title += f" ({st.session_state.selected_date.strftime('%d %b')} - {end_date.strftime('%d %b %Y')})"
+        elif st.session_state.view == "daily":
+            title += f" ({st.session_state.selected_date.strftime('%d %B %Y')})"
+        elif st.session_state.view == "hourly":
+            title += f" ({st.session_state.selected_date.strftime('%d %B %Y')} {st.session_state.selected_hour}:00)"
+        
+        fig.update_layout(
+            title=title,
+            xaxis_title="Time",
+            yaxis_title="Power Demand (MW)",
+            hovermode="x unified",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    def display_insights(self, filtered_data, filtered_forecast):
+        """Display insights based on the data"""
+        st.markdown("<h2 class='sub-header'>Insights & Analysis</h2>", unsafe_allow_html=True)
+        
+        if filtered_data is None or filtered_data.empty:
+            st.warning("No data available for insights.")
+            return
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
+            st.subheader("Consumption Patterns")
             
-            with col2:
-                st.subheader("Forecast Data")
-                # Monthly download
-                forecast_monthly_csv = monthly_forecast.to_csv()
-                st.download_button(
-                    label="Download Monthly Forecast Data",
-                    data=forecast_monthly_csv,
-                    file_name=f"forecast_power_demand_{selected_month}.csv",
-                    mime="text/csv"
-                )
-                # Weekly download
-                forecast_weekly_csv = weekly_forecast.to_csv()
-                st.download_button(
-                    label="Download Weekly Forecast Data",
-                    data=forecast_weekly_csv,
-                    file_name=f"forecast_power_demand_week_{selected_week}.csv",
-                    mime="text/csv"
-                )
-                # Daily download
-                forecast_daily_csv = daily_forecast.to_csv()
-                st.download_button(
-                    label="Download Daily Forecast Data",
-                    data=forecast_daily_csv,
-                    file_name=f"forecast_power_demand_{selected_date.strftime('%Y-%m-%d')}.csv",
-                    mime="text/csv"
-                )
+            # Time-based patterns
+            if st.session_state.view in ["monthly", "weekly"]:
+                # Group by hour to show daily pattern
+                hourly_avg = filtered_data.groupby('hour')['demand_mw'].mean().reset_index()
                 
-            # Footer with notes
-            st.markdown("""
-            ---
-            ### Notes
-            - Historical data shows actual power demand patterns from 2021-2024
-            - Forecast data includes 5% annual growth projection for 2025
-            - Both analyses maintain consistent daily and seasonal patterns
-            - Download options available for detailed data analysis
+                fig = px.line(
+                    hourly_avg, 
+                    x='hour', 
+                    y='demand_mw',
+                    labels={'hour': 'Hour of Day', 'demand_mw': 'Average Demand (MW)'},
+                    title="Daily Consumption Pattern"
+                )
+                fig.update_layout(height=300)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                peak_hour = hourly_avg.loc[hourly_avg['demand_mw'].idxmax(), 'hour']
+                st.markdown(f"⚡ **Peak demand typically occurs around {peak_hour}:00**")
+                
+            elif st.session_state.view == "daily":
+                # Show hourly breakdown for the day
+                fig = px.bar(
+                    filtered_data,
+                    x='hour',
+                    y='demand_mw',
+                    color='demand_mw',
+                    color_continuous_scale='Blues',
+                    labels={'hour': 'Hour of Day', 'demand_mw': 'Demand (MW)'},
+                    title="Hourly Consumption"
+                )
+                fig.update_layout(height=300)
+                st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
+            st.subheader("Comparative Analysis")
+            
+            if st.session_state.view == "monthly":
+                # Compare with previous month
+                current_month = st.session_state.selected_date.month
+                current_year = st.session_state.selected_date.year
+                
+                # Calculate previous month
+                if current_month == 1:
+                    prev_month = 12
+                    prev_year = current_year - 1
+                else:
+                    prev_month = current_month - 1
+                    prev_year = current_year
+                
+                # Get data for previous month
+                prev_month_data = self.data[(self.data['year'] == prev_year) & (self.data['month'] == prev_month)]
+                
+                if not prev_month_data.empty:
+                    current_avg = filtered_data['demand_mw'].mean()
+                    prev_avg = prev_month_data['demand_mw'].mean()
+                    change_pct = (current_avg - prev_avg) / prev_avg * 100
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Bar(
+                        x=['Previous Month', 'Current Month'],
+                        y=[prev_avg, current_avg],
+                        marker_color=['#90CAF9', '#1E88E5']
+                    ))
+                    fig.update_layout(
+                        title="Month-over-Month Comparison",
+                        yaxis_title="Average Demand (MW)",
+                        height=300
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    if change_pct > 0:
+                        st.markdown(f"📈 **Demand increased by {change_pct:.1f}% compared to previous month**")
+                    else:
+                        st.markdown(f"📉 **Demand decreased by {abs(change_pct):.1f}% compared to previous month**")
+            
+            elif st.session_state.view == "daily":
+                # Compare with same day last week
+                current_date = st.session_state.selected_date
+                last_week_date = current_date - datetime.timedelta(days=7)
+                
+                last_week_data = self.data[self.data['date'] == last_week_date]
+                
+                if not last_week_data.empty:
+                    # Group by hour for comparison
+                    current_hourly = filtered_data.groupby('hour')['demand_mw'].mean().reset_index()
+                    last_week_hourly = last_week_data.groupby('hour')['demand_mw'].mean().reset_index()
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=current_hourly['hour'],
+                        y=current_hourly['demand_mw'],
+                        name="Current Day",
+                        line=dict(color="#1E88E5", width=2)
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=last_week_hourly['hour'],
+                        y=last_week_hourly['demand_mw'],
+                        name="Same Day Last Week",
+                        line=dict(color="#90CAF9", width=2, dash='dot')
+                    ))
+                    fig.update_layout(
+                        title="Day-over-Day Comparison",
+                        xaxis_title="Hour of Day",
+                        yaxis_title="Demand (MW)",
+                        height=300
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+    
+    def display_forecast_insights(self, filtered_forecast):
+        """Display forecast insights"""
+        if filtered_forecast is None or filtered_forecast.empty or not st.session_state.get('show_forecast', True):
+            return
+            
+        st.markdown("<h2 class='sub-header'>Forecast Insights</h2>", unsafe_allow_html=True)
+        st.markdown("<div class='insight-box'>", unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Forecast summary stats
+            forecast_peak = filtered_forecast['demand_mw'].max()
+            forecast_avg = filtered_forecast['demand_mw'].mean()
+            forecast_min = filtered_forecast['demand_mw'].min()
+            
+            st.subheader("Forecast Summary")
+            st.markdown(f"""
+            - **Peak Demand Forecast:** {forecast_peak:.1f} MW
+            - **Average Demand Forecast:** {forecast_avg:.1f} MW
+            - **Minimum Demand Forecast:** {forecast_min:.1f} MW
             """)
-else:
-    st.error("Failed to load data. Please check if the data file exists.") 
+            
+            peak_timestamp = filtered_forecast.loc[filtered_forecast['demand_mw'].idxmax(), 'timestamp']
+            peak_date = peak_timestamp.strftime('%d %B %Y')
+            peak_time = peak_timestamp.strftime('%H:%M')
+            
+            st.markdown(f"⚠️ **Expected peak on {peak_date} at {peak_time}**")
+        
+        with col2:
+            # Distribution of forecast
+            fig = px.histogram(
+                filtered_forecast,
+                x='demand_mw',
+                nbins=20,
+                color_discrete_sequence=['#FFA000'],
+                labels={'demand_mw': 'Demand (MW)'},
+                title="Forecast Demand Distribution"
+            )
+            fig.update_layout(height=250)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    def display_footer(self):
+        """Display application footer"""
+        st.markdown("---")
+        st.markdown(
+            "<p style='text-align:center'>Delhi Power Consumption Forecast Application | &copy; 2024</p>",
+            unsafe_allow_html=True
+        )
+    
+    def run(self):
+        """Main application execution"""
+        # Check authentication
+        if not st.session_state.authenticated:
+            self.display_header()
+            if not self.authenticate_user():
+                return
+            # Reload the app after authentication
+            st.rerun()
+        
+        # Display header
+        self.display_header()
+        
+        # Data should already be loaded during authentication, but check just in case
+        if not st.session_state.data_loaded or self.data is None:
+            # Data not loaded yet (should be rare)
+            self.load_sample_data()
+            self.generate_sample_forecast()
+            st.session_state.data_loaded = True
+        
+        # Display sidebar
+        self.display_sidebar()
+        
+        # Filter data based on view
+        filtered_data, filtered_forecast = self.filter_data_by_view(self.data, self.forecasts)
+        
+        # Display key metrics
+        self.display_key_metrics(filtered_data, filtered_forecast)
+        
+        # Display main chart
+        self.display_power_demand_chart(filtered_data, filtered_forecast)
+        
+        # Display insights
+        self.display_insights(filtered_data, filtered_forecast)
+        
+        # Display forecast insights
+        self.display_forecast_insights(filtered_forecast)
+        
+        # Display footer
+        self.display_footer()
+        
+        # Log page view
+        logger.info(f"Page viewed: {st.session_state.view} view by {st.session_state.user_info.get('name', 'Unknown')}")
+
+
+if __name__ == "__main__":
+    # Create and run the application
+    app = PowerForecastApp()
+    app.run()
